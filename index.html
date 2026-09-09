@@ -1835,13 +1835,22 @@ async function pushChunked(str,existingBinIds,apiKey,namePrefix,onProgress){
   for(let i=0;i<chunks.length;i++){
     if(!binIds[i]){
       onProgress&&onProgress(`⏳ Creo bin ${namePrefix} ${i+1}...`);
-      binIds[i]=await jsonbinCreate(apiKey,{chunk:''},`${namePrefix}-${i+1}`);
+      try{
+        binIds[i]=await jsonbinCreate(apiKey,{chunk:''},`${namePrefix}-${i+1}`);
+      }catch(e){
+        throw new Error(`[creazione bin ${namePrefix} #${i+1}] ${e.message}`);
+      }
     }
   }
   // carica ogni blocco
   for(let i=0;i<chunks.length;i++){
-    onProgress&&onProgress(`⏳ Carico ${namePrefix} — blocco ${i+1}/${chunks.length}...`);
-    await jsonbinPut(binIds[i],apiKey,{chunk:chunks[i]});
+    const kb=(new Blob([JSON.stringify({chunk:chunks[i]})]).size/1024).toFixed(1);
+    onProgress&&onProgress(`⏳ Carico ${namePrefix} — blocco ${i+1}/${chunks.length} (${kb}KB)...`);
+    try{
+      await jsonbinPut(binIds[i],apiKey,{chunk:chunks[i]});
+    }catch(e){
+      throw new Error(`[blocco ${namePrefix} #${i+1}/${chunks.length}, ${kb}KB] ${e.message}`);
+    }
   }
   // se i dati si sono ridotti, svuota i bin in eccesso rimasti dalla sync precedente
   for(let i=chunks.length;i<binIds.length;i++){
@@ -1854,8 +1863,12 @@ async function pullChunked(binIds,apiKey,onProgress,namePrefix){
   let result='';
   for(let i=0;i<binIds.length;i++){
     onProgress&&onProgress(`⏳ Scarico ${namePrefix} — blocco ${i+1}/${binIds.length}...`);
-    const d=await jsonbinGet(binIds[i],apiKey);
-    result+=d.chunk||'';
+    try{
+      const d=await jsonbinGet(binIds[i],apiKey);
+      result+=d.chunk||'';
+    }catch(e){
+      throw new Error(`[scarico ${namePrefix} #${i+1}/${binIds.length}] ${e.message}`);
+    }
   }
   return result;
 }
@@ -1870,13 +1883,19 @@ async function cloudPush(){
     const entriesBinIds=await pushChunked(localStorage.getItem(EK)||'',cfg.entriesBinIds,cfg.apiKey,'SecretBox-Password',setStatus);
     setSyncCfg({entriesBinIds});
     setStatus('⏳ Carico metadati...');
-    await jsonbinPut(cfg.binId,cfg.apiKey,{
+    const metaObj={
       salt:localStorage.getItem(SK)||'',
       vault:localStorage.getItem(VK)||'',
       cats:localStorage.getItem(CK)||'',
       notecats:localStorage.getItem(NCK)||'',
       notesBinIds,entriesBinIds,ts:Date.now()
-    });
+    };
+    try{
+      await jsonbinPut(cfg.binId,cfg.apiKey,metaObj);
+    }catch(e){
+      const kb=(new Blob([JSON.stringify(metaObj)]).size/1024).toFixed(1);
+      throw new Error(`[bin metadati, ${kb}KB] ${e.message}`);
+    }
     setSyncCfg({lastSync:Date.now()});
     gi('syncLastInfo').textContent='Ultima sincronizzazione: '+new Date().toLocaleString('it-IT');
     const totalBins=1+notesBinIds.length+entriesBinIds.length;
