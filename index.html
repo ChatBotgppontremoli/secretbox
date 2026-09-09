@@ -1819,39 +1819,68 @@ async function jsonbinGet(binId,apiKey){
   const json=await res.json();
   return json.record||json;
 }
+/* ── Chunking dinamico: divide stringhe grandi in più bin da CHUNK_SIZE caratteri
+   così anche archivi molto grandi restano sotto il limite di 100KB/bin del piano gratuito ── */
+const CHUNK_SIZE=80000; // margine di sicurezza sotto i 100KB
+function chunkString(str,size){
+  if(!str)return[];
+  const out=[];
+  for(let i=0;i<str.length;i+=size)out.push(str.slice(i,i+size));
+  return out;
+}
+async function pushChunked(str,existingBinIds,apiKey,namePrefix,onProgress){
+  const chunks=chunkString(str,CHUNK_SIZE);
+  const binIds=existingBinIds?[...existingBinIds]:[];
+  // crea i bin mancanti
+  for(let i=0;i<chunks.length;i++){
+    if(!binIds[i]){
+      onProgress&&onProgress(`⏳ Creo bin ${namePrefix} ${i+1}...`);
+      binIds[i]=await jsonbinCreate(apiKey,{chunk:''},`${namePrefix}-${i+1}`);
+    }
+  }
+  // carica ogni blocco
+  for(let i=0;i<chunks.length;i++){
+    onProgress&&onProgress(`⏳ Carico ${namePrefix} — blocco ${i+1}/${chunks.length}...`);
+    await jsonbinPut(binIds[i],apiKey,{chunk:chunks[i]});
+  }
+  // se i dati si sono ridotti, svuota i bin in eccesso rimasti dalla sync precedente
+  for(let i=chunks.length;i<binIds.length;i++){
+    await jsonbinPut(binIds[i],apiKey,{chunk:''});
+  }
+  return binIds;
+}
+async function pullChunked(binIds,apiKey,onProgress,namePrefix){
+  if(!binIds||!binIds.length)return'';
+  let result='';
+  for(let i=0;i<binIds.length;i++){
+    onProgress&&onProgress(`⏳ Scarico ${namePrefix} — blocco ${i+1}/${binIds.length}...`);
+    const d=await jsonbinGet(binIds[i],apiKey);
+    result+=d.chunk||'';
+  }
+  return result;
+}
 async function cloudPush(){
   const cfg=getSyncCfg();
   if(!cfg.binId||!cfg.apiKey){gi('syncStatus').textContent='⚠️ Configura prima Bin ID e API Key';gi('syncStatus').style.color='var(--amb)';return}
   gi('syncStatus').textContent='⏳ Caricamento in corso...';gi('syncStatus').style.color='var(--txd)';
+  const setStatus=t=>{gi('syncStatus').textContent=t};
   try{
-    let notesBinId=cfg.notesBinId,entriesBinId=cfg.entriesBinId;
-    // Crea automaticamente bin dedicati per note e password se non esistono ancora
-    // (il piano gratuito JSONBin limita ogni bin a 100KB: dividiamo i dati per restare sotto la soglia)
-    if(!notesBinId){
-      gi('syncStatus').textContent='⏳ Creo bin dedicato per le note...';
-      notesBinId=await jsonbinCreate(cfg.apiKey,{notes:''},'SecretBox-Note');
-      setSyncCfg({notesBinId});
-    }
-    if(!entriesBinId){
-      gi('syncStatus').textContent='⏳ Creo bin dedicato per le password...';
-      entriesBinId=await jsonbinCreate(cfg.apiKey,{entries:''},'SecretBox-Password');
-      setSyncCfg({entriesBinId});
-    }
-    gi('syncStatus').textContent='⏳ Carico metadati...';
+    const notesBinIds=await pushChunked(localStorage.getItem(NK)||'',cfg.notesBinIds,cfg.apiKey,'SecretBox-Note',setStatus);
+    setSyncCfg({notesBinIds});
+    const entriesBinIds=await pushChunked(localStorage.getItem(EK)||'',cfg.entriesBinIds,cfg.apiKey,'SecretBox-Password',setStatus);
+    setSyncCfg({entriesBinIds});
+    setStatus('⏳ Carico metadati...');
     await jsonbinPut(cfg.binId,cfg.apiKey,{
       salt:localStorage.getItem(SK)||'',
       vault:localStorage.getItem(VK)||'',
       cats:localStorage.getItem(CK)||'',
       notecats:localStorage.getItem(NCK)||'',
-      notesBinId,entriesBinId,ts:Date.now()
+      notesBinIds,entriesBinIds,ts:Date.now()
     });
-    gi('syncStatus').textContent='⏳ Carico note...';
-    await jsonbinPut(notesBinId,cfg.apiKey,{notes:localStorage.getItem(NK)||''});
-    gi('syncStatus').textContent='⏳ Carico password...';
-    await jsonbinPut(entriesBinId,cfg.apiKey,{entries:localStorage.getItem(EK)||''});
     setSyncCfg({lastSync:Date.now()});
     gi('syncLastInfo').textContent='Ultima sincronizzazione: '+new Date().toLocaleString('it-IT');
-    gi('syncStatus').textContent='✅ Caricato su cloud (dati cifrati, su 3 bin)';gi('syncStatus').style.color='var(--grn)';
+    const totalBins=1+notesBinIds.length+entriesBinIds.length;
+    gi('syncStatus').textContent=`✅ Caricato su cloud (dati cifrati, su ${totalBins} bin)`;gi('syncStatus').style.color='var(--grn)';
     toast('☁️ Caricato su cloud ✓');
   }catch(e){
     gi('syncStatus').textContent='❌ Errore: '+e.message;gi('syncStatus').style.color='var(--red)';
@@ -1862,22 +1891,30 @@ async function cloudPull(){
   if(!cfg.binId||!cfg.apiKey){gi('syncStatus').textContent='⚠️ Configura prima Bin ID e API Key';gi('syncStatus').style.color='var(--amb)';return}
   if(!confirm('Questo sovrascriverà i dati locali con quelli presenti sul cloud. Continuare?'))return;
   gi('syncStatus').textContent='⏳ Scaricamento in corso...';gi('syncStatus').style.color='var(--txd)';
+  const setStatus=t=>{gi('syncStatus').textContent=t};
   try{
     const meta=await jsonbinGet(cfg.binId,cfg.apiKey);
     if(!meta.salt||!meta.vault)throw new Error('Bin vuoto o formato non valido');
-    let notesTxt=meta.notes||'',entriesTxt=meta.entries||'';
-    // Formato nuovo: note e password sono su bin separati referenziati nei metadati
-    if(meta.notesBinId){
-      gi('syncStatus').textContent='⏳ Scarico note...';
+    let notesTxt='',entriesTxt='';
+    // Formato a blocchi (nuovo): array di bin id
+    if(meta.notesBinIds&&meta.notesBinIds.length){
+      notesTxt=await pullChunked(meta.notesBinIds,cfg.apiKey,setStatus,'note');
+      setSyncCfg({notesBinIds:meta.notesBinIds});
+    }else if(meta.notesBinId){
+      // Formato precedente (bin singolo): compatibilità con sync fatte prima del chunking
+      setStatus('⏳ Scarico note...');
       const nd=await jsonbinGet(meta.notesBinId,cfg.apiKey);
       notesTxt=nd.notes||'';
-      setSyncCfg({notesBinId:meta.notesBinId});
+      setSyncCfg({notesBinIds:[meta.notesBinId]});
     }
-    if(meta.entriesBinId){
-      gi('syncStatus').textContent='⏳ Scarico password...';
+    if(meta.entriesBinIds&&meta.entriesBinIds.length){
+      entriesTxt=await pullChunked(meta.entriesBinIds,cfg.apiKey,setStatus,'password');
+      setSyncCfg({entriesBinIds:meta.entriesBinIds});
+    }else if(meta.entriesBinId){
+      setStatus('⏳ Scarico password...');
       const ed=await jsonbinGet(meta.entriesBinId,cfg.apiKey);
       entriesTxt=ed.entries||'';
-      setSyncCfg({entriesBinId:meta.entriesBinId});
+      setSyncCfg({entriesBinIds:[meta.entriesBinId]});
     }
     localStorage.setItem(SK,meta.salt);
     localStorage.setItem(VK,meta.vault);
